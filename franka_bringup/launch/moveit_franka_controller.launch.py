@@ -19,7 +19,11 @@ from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration, PathJoinSubstitution
 from launch_ros.actions import Node
 from launch_ros.substitutions import FindPackageShare
-
+import os
+from ament_index_python.packages import get_package_share_directory
+from launch.substitutions import Command, FindExecutable
+from launch_ros.parameter_descriptions import ParameterValue
+import math
 
 def generate_launch_description():
     robot_ip_parameter_name = 'robot_ip'
@@ -35,6 +39,35 @@ def generate_launch_description():
     use_fake_hardware = LaunchConfiguration(use_fake_hardware_parameter_name)
     fake_sensor_commands = LaunchConfiguration(fake_sensor_commands_parameter_name)
     use_rviz = LaunchConfiguration(use_rviz_parameter_name)
+
+    # franka_semantic_xacro_file = os.path.join(
+    #     get_package_share_directory('franka_fr3_moveit_config'),
+    #     'srdf', 'fr3_arm.srdf.xacro'
+    # )
+
+    # robot_description_semantic_command = Command(
+    #     [FindExecutable(name='xacro'), ' ',
+    #      franka_semantic_xacro_file, ' hand:=', load_gripper]
+    # )
+
+    # robot_description_semantic = {'robot_description_semantic': ParameterValue(
+    #     robot_description_semantic_command, value_type=str)}
+    
+    panda_hand_to_fd_base_tf = Node(
+        package='tf2_ros',
+        executable='static_transform_publisher',
+        name='panda_hand_to_fd_base_tf',
+        arguments=['0.5', '0.0', '0.3', '0.0', '0.0', '0.0', 'base', 'fd_base'],
+        output='screen'
+    )
+    static_tf = Node(
+        package="tf2_ros",
+        executable="static_transform_publisher",
+        name="static_transform_publisher",
+        output="log",
+        arguments=["0.0", "0.0", "0.0", "0.0", "0.0", "0.0", "world", "base"],
+    )
+    
 
     return LaunchDescription([
         DeclareLaunchArgument(
@@ -97,9 +130,10 @@ def generate_launch_description():
         Node(
             package='controller_manager',
             executable='spawner',
-            arguments=['joint_impedance_with_ik_example_controller'],
+            arguments=['moveit_franka_controller'],             
             output='screen',
         ),
-
+        panda_hand_to_fd_base_tf,
+        static_tf,
         
     ])

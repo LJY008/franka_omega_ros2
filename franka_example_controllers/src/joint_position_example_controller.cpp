@@ -70,6 +70,7 @@ controller_interface::return_type JointPositionExampleController::update(
     } else {
       elapsed_time_ += trajectory_period_;
     }
+    elapsed_time_ += trajectory_period_;
   }
 
   double delta_angle = M_PI / 16 * (1 - std::cos(M_PI / 5.0 * elapsed_time_)) * 0.2;
@@ -113,6 +114,10 @@ CallbackReturn JointPositionExampleController::on_configure(
   }
 
   arm_id_ = robot_utils::getRobotNameFromDescription(robot_description_, get_node()->get_logger());
+  if (!arm_id_.empty()) {
+    RCLCPP_INFO(get_node()->get_logger(), "Extracted Robot Name: %s", arm_id_.c_str());
+    return CallbackReturn::ERROR;
+  }
 
   return CallbackReturn::SUCCESS;
 }

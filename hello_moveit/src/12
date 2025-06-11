@@ -1,0 +1,640 @@
+#include <controller_interface/controller_interface.hpp>
+#include <hardware_interface/types/hardware_interface_type_values.hpp>
+#include <geometry_msgs/msg/pose_stamped.hpp>
+#include <moveit_msgs/srv/get_position_ik.hpp>
+#include <Eigen/Geometry>
+#include <tf2_eigen/tf2_eigen.hpp>
+#include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
+#include <rclcpp/rclcpp.hpp>
+#include <tf2_ros/buffer.h>
+#include <tf2_ros/transform_listener.h>
+#include <vector>
+#include <string>
+#include <algorithm>
+#include <sstream>
+#include <std_msgs/msg/float64_multi_array.hpp>
+#include <franka_semantic_components/franka_robot_model.hpp>
+#include <rclcpp_action/rclcpp_action.hpp>
+#include <franka_msgs/action/grasp.hpp>
+#include <franka_msgs/action/move.hpp>
+#include <std_srvs/srv/trigger.hpp>
+
+
+namespace franka_example_controllers {
+
+class JointImpedanceMoveItController : public controller_interface::ControllerInterface {
+public:
+  JointImpedanceMoveItController() = default;
+  ~JointImpedanceMoveItController() override = default;
+
+  controller_interface::CallbackReturn on_init() override {
+    RCLCPP_INFO(get_node()->get_logger(), "初始化JointImpedanceMoveItController...");
+    try {
+      auto_declare<std::string>("ee_pose_topic", "/fd/ee_pose");
+      auto_declare<double>("ik_timeout", 0.2);
+      auto_declare<std::vector<std::string>>("joints", std::vector<std::string>());
+      auto_declare<std::string>("arm_id", "fr3");
+      auto_declare<std::vector<double>>("k_gains", std::vector<double>(7, 100.0));
+      auto_declare<std::vector<double>>("d_gains", std::vector<double>(7, 10.0));
+      RCLCPP_INFO(get_node()->get_logger(), "参数声明完成");
+      return controller_interface::CallbackReturn::SUCCESS;
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_node()->get_logger(), "初始化时出错: %s", e.what());
+      return controller_interface::CallbackReturn::ERROR;
+    }
+  }
+
+  controller_interface::CallbackReturn on_configure(const rclcpp_lifecycle::State&) override {
+    RCLCPP_INFO(get_node()->get_logger(), "配置控制器...");
+    try {
+      ee_pose_topic_ = get_node()->get_parameter("ee_pose_topic").as_string();
+      ik_timeout_ = get_node()->get_parameter("ik_timeout").as_double();
+      joint_names_ = get_node()->get_parameter("joints").as_string_array();
+      arm_id_ = get_node()->get_parameter("arm_id").as_string();
+      k_gains_ = get_node()->get_parameter("k_gains").as_double_array();
+      d_gains_ = get_node()->get_parameter("d_gains").as_double_array();
+
+      if (joint_names_.size() != 7 || k_gains_.size() != 7 || d_gains_.size() != 7) {
+        RCLCPP_ERROR(get_node()->get_logger(), "关节名、k_gains、d_gains长度必须为7");
+        return controller_interface::CallbackReturn::ERROR;
+      }
+
+      tf_buffer_ = std::make_shared<tf2_ros::Buffer>(get_node()->get_clock());
+      tf_listener_ = std::make_shared<tf2_ros::TransformListener>(*tf_buffer_);
+
+      ik_client_ = get_node()->create_client<moveit_msgs::srv::GetPositionIK>("/compute_ik");
+      if (!ik_client_->wait_for_service(std::chrono::seconds(5))) {
+        RCLCPP_ERROR(get_node()->get_logger(), "等待IK服务/compute_ik超时");
+        return controller_interface::CallbackReturn::ERROR;
+      }
+      
+      force_pub_ = get_node()->create_publisher<std_msgs::msg::Float64MultiArray>("/fd/fd_controller/commands", 10);
+
+      joint_positions_desired_.resize(7, 0.0);
+      joint_positions_current_.resize(7, 0.0);
+      joint_velocities_current_.resize(7, 0.0);
+      joint_efforts_current_.resize(7, 0.0);
+      dq_filtered_ = Eigen::VectorXd::Zero(7);      
+      joint_positions_target_.assign(7, 0.0);
+      
+      franka_robot_model_ = std::make_unique<franka_semantic_components::FrankaRobotModel>(
+        arm_id_ + "/robot_model", arm_id_ + "/robot_state"      );
+      
+         // 添加食指坐标系参数
+      index_finger_frame_ = get_node()->declare_parameter<std::string>("index_finger_frame", "fd_virtual_clutch_link");
+      RCLCPP_INFO(get_node()->get_logger(), "将使用食指坐标系: %s", index_finger_frame_.c_str());
+      
+      // 创建食指位姿发布器
+      index_pose_pub_ = get_node()->create_publisher<geometry_msgs::msg::PoseStamped>("/fd/index_pose", 10);
+
+      gripper_move_action_client_ = rclcpp_action::create_client<franka_msgs::action::Move>(
+        get_node(), "/" + arm_id_ + "_gripper/move");
+      gripper_grasp_action_client_ = rclcpp_action::create_client<franka_msgs::action::Grasp>(
+        get_node(), "/" + arm_id_ + "_gripper/grasp");
+      
+      RCLCPP_INFO(get_node()->get_logger(), "配置完成");
+      return controller_interface::CallbackReturn::SUCCESS;
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_node()->get_logger(), "配置控制器时发生错误: %s", e.what());
+      return controller_interface::CallbackReturn::ERROR;
+    }
+  }
+
+  controller_interface::CallbackReturn on_activate(const rclcpp_lifecycle::State&) override {
+    RCLCPP_INFO(get_node()->get_logger(), "激活控制器...");
+    try {
+      if (command_interfaces_.size() != 7 || state_interfaces_.size() < 21) {
+        RCLCPP_ERROR(get_node()->get_logger(), "接口数量不匹配");
+        return controller_interface::CallbackReturn::ERROR;
+      }
+      // 初始化当前关节状态
+      update_joint_states();
+      joint_positions_desired_ = joint_positions_current_;
+      joint_positions_target_ = joint_positions_current_;
+      franka_robot_model_->assign_loaned_state_interfaces(state_interfaces_);
+
+      pose_sub_ = get_node()->create_subscription<geometry_msgs::msg::PoseStamped>(
+        ee_pose_topic_, 10,
+        std::bind(&JointImpedanceMoveItController::pose_callback, this, std::placeholders::_1));
+      RCLCPP_INFO(get_node()->get_logger(), "已创建位姿订阅器，话题: %s", ee_pose_topic_.c_str());
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_node()->get_logger(), "激活控制器时出错：%s", e.what());
+      return controller_interface::CallbackReturn::ERROR;
+    }
+    open_gripper();
+    return controller_interface::CallbackReturn::SUCCESS;
+  }
+
+  controller_interface::CallbackReturn on_deactivate(const rclcpp_lifecycle::State&) override {
+    RCLCPP_INFO(get_node()->get_logger(), "停用控制器...");
+    for (size_t i = 0; i < 7; ++i) {
+      command_interfaces_[i].set_value(0.0);
+    }
+
+    if (franka_robot_model_) {
+      franka_robot_model_->release_interfaces();
+    }
+    
+    return controller_interface::CallbackReturn::SUCCESS;
+  }
+
+  controller_interface::InterfaceConfiguration command_interface_configuration() const override {
+    controller_interface::InterfaceConfiguration config;
+    config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
+    for (int i = 1; i <= 7; ++i) {
+      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/effort");
+    }
+    return config;
+  }
+
+  controller_interface::InterfaceConfiguration state_interface_configuration() const override {
+    controller_interface::InterfaceConfiguration config;
+    config.type = controller_interface::interface_configuration_type::INDIVIDUAL;
+    for (int i = 1; i <= 7; ++i) {
+      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/position");
+    }
+    for (int i = 1; i <= 7; ++i) {
+      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/velocity");
+    }
+    for (int i = 1; i <= 7; ++i) {
+      config.names.push_back(arm_id_ + "_joint" + std::to_string(i) + "/effort");
+    }
+    config.names.push_back(arm_id_ + "/robot_model");
+    config.names.push_back(arm_id_ + "/robot_state");
+  
+    
+    return config;
+
+    
+  }
+
+  controller_interface::return_type update(const rclcpp::Time&, const rclcpp::Duration& period) override {
+    update_joint_states();
+
+    double dt = period.seconds();
+
+    for (size_t i = 0; i < 7; ++i) {
+      joint_positions_target_[i] = std::clamp(joint_positions_target_[i], q_min[i], q_max[i]);
+    }
+  
+    for (size_t i = 0; i < 7; ++i) {
+      double diff = joint_positions_target_[i] - joint_positions_desired_[i];
+      if (std::abs(diff) > max_joint_step_) {
+        joint_positions_desired_[i] += max_joint_step_ * (diff > 0 ? 1 : -1);
+      } else {
+        joint_positions_desired_[i] = joint_positions_target_[i];
+      }
+    }
+    // 阻抗控制律 tau = K(qd-q) - D(dq)
+    Eigen::Map<Eigen::VectorXd> qd(joint_positions_desired_.data(), 7);
+    Eigen::Map<Eigen::VectorXd> q(joint_positions_current_.data(), 7);
+    Eigen::Map<Eigen::VectorXd> dq(joint_velocities_current_.data(), 7);
+    Eigen::Map<Eigen::VectorXd> K(k_gains_.data(), 7);
+    Eigen::Map<Eigen::VectorXd> D(d_gains_.data(), 7);
+
+    dq_filtered_ = (1.0 - dq_filter_alpha_) * dq_filtered_ + dq_filter_alpha_ * dq;
+    Eigen::VectorXd tau = K.cwiseProduct(qd - q) - D.cwiseProduct(dq_filtered_);
+
+    // 限制力矩和力矩变化率
+    static Eigen::VectorXd tau_last = Eigen::VectorXd::Zero(7);
+    for (int i = 0; i < 7; ++i) {
+      // 限制力矩
+      tau(i) = std::clamp(tau(i), -tau_max[i], tau_max[i]);
+      // 限制力矩变化率
+      double dtau = tau(i) - tau_last(i);
+      double max_dtau = dtau_max[i] * dt;
+      if (std::abs(dtau) > max_dtau) {
+        tau(i) = tau_last(i) + max_dtau * (dtau > 0 ? 1 : -1);
+      }
+    }
+    tau_last = tau;
+
+    // 打印tau
+    // std::ostringstream oss;
+    // oss << "tau: ";
+    // for (int i = 0; i < tau.size(); ++i) {
+    //   oss << tau(i) << " ";
+    // }
+    // RCLCPP_INFO(get_node()->get_logger(), "%s", oss.str().c_str());
+
+    for (size_t i = 0; i < 7; ++i) {
+      command_interfaces_[i].set_value(tau(i));
+    }
+
+    try {
+      // 获取当前关节力矩
+      Eigen::VectorXd tau_measured(7);
+      for (size_t i = 0; i < 7; ++i) {
+        tau_measured(i) = joint_efforts_current_[i];
+      }
+    
+      // 获取末端雅可比（base系下）
+      std::array<double, 42> jacobian_array = franka_robot_model_->getZeroJacobian(franka::Frame::kEndEffector);
+      Eigen::Map<const Eigen::Matrix<double, 6, 7, Eigen::RowMajor>> J(jacobian_array.data());
+    
+      //  获取重力和科里奥利力
+      std::array<double, 7> gravity_array = franka_robot_model_->getGravityForceVector();
+      Eigen::Map<const Eigen::VectorXd> gravity(gravity_array.data(), 7);
+      
+      // 科里奥利力（可选）
+      std::array<double, 7> coriolis_array = franka_robot_model_->getCoriolisForceVector();
+      Eigen::Map<const Eigen::VectorXd> coriolis(coriolis_array.data(), 7);
+
+      // 获取质量矩阵
+      std::array<double, 49> mass_array = franka_robot_model_->getMassMatrix();
+      Eigen::Map<const Eigen::Matrix<double, 7, 7, Eigen::RowMajor>> M(mass_array.data());
+
+      // 估算关节加速度（差分+一阶滤波）
+      static std::vector<double> last_joint_velocities(7, 0.0);
+      static std::vector<double> last_joint_acc(7, 0.0);
+      static rclcpp::Time last_time = get_node()->now();
+      double dt_acc = (get_node()->now() - last_time).seconds();
+      std::vector<double> joint_acc(7, 0.0);
+      double acc_alpha = 0.8; // 0.7~0.95之间
+
+      if (dt_acc > 1e-4 && dt_acc < 0.1) { // 防止dt过小或过大
+        for (size_t i = 0; i < 7; ++i) {
+          double raw_acc = (joint_velocities_current_[i] - last_joint_velocities[i]) / dt_acc;
+          joint_acc[i] = acc_alpha * last_joint_acc[i] + (1 - acc_alpha) * raw_acc;
+          last_joint_velocities[i] = joint_velocities_current_[i];
+          last_joint_acc[i] = joint_acc[i];
+        }
+        last_time = get_node()->now();
+      } else {
+        // dt异常时，直接用上次加速度
+        joint_acc = last_joint_acc;
+        last_time = get_node()->now();
+      }
+      Eigen::VectorXd ddq = Eigen::Map<Eigen::VectorXd>(joint_acc.data(), 7);
+      Eigen::VectorXd inertia = M * ddq;
+    
+      // 去除重力、科里奥利力和惯性力的影响得到净外力矩
+      Eigen::VectorXd tau_ext = tau_measured - gravity - coriolis;
+      
+      // 用雅可比矩阵估算末端力/力矩
+      Eigen::VectorXd wrench_tcp = J.transpose().completeOrthogonalDecomposition().solve(tau_ext);
+      
+      
+    
+      // 6. 限制力/力矩幅值
+      double max_force = 30.0;  // 最大力 (N)
+      double max_torque = 5.0;  // 最大力矩 (Nm)
+      
+      for (int i = 0; i < 3; ++i) {
+        wrench_tcp(i) = std::clamp(wrench_tcp(i), -max_force, max_force);
+      }
+      for (int i = 3; i < 6; ++i) {
+        wrench_tcp(i) = std::clamp(wrench_tcp(i), -max_torque, max_torque);
+      }
+    
+      // 7. 打印结果
+      Eigen::Vector3d force = wrench_tcp.head(3);
+      double force_magnitude = force.norm();//欧几里德范数
+      Eigen::Vector3d force_dir = Eigen::Vector3d::Zero();
+      
+      if (force_magnitude > 0.5) {  
+        force_dir = force.normalized();
+      }
+      
+      // RCLCPP_INFO_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+      //   "TCP力(补偿后): [%.3f, %.3f, %.3f] N (|F|=%.3f), 方向: [%.3f, %.3f, %.3f]",
+      //   force(0), force(1), force(2), force_magnitude,
+      //   force_dir(0), force_dir(1), force_dir(2));
+
+      //   std_msgs::msg::Float64MultiArray msg;
+      //   msg.data.resize(7);
+      //   msg.data[0] = force(0);
+      //   msg.data[1] = force(1);
+      //   msg.data[2] = force(2);
+      //   // 这里假设wrench_tcp的第3~5分量为力矩
+      //   msg.data[3] = wrench_tcp(3);
+      //   msg.data[4] = wrench_tcp(4);
+      //   msg.data[5] = wrench_tcp(5);
+      //   msg.data[6] = 0.0; // 夹爪力，暂时为0
+      //   force_pub_->publish(msg);
+      
+      // 1. 高通滤波（去除慢变基线）
+    force_highpass_ = hp_alpha * (force_highpass_ + force - force_last_);
+    force_last_ = force;
+
+    // 2. 低通滤波（抑制高频噪声，得到带通结果）
+    double lp_alpha = 0.8; // 低通滤波系数，可调
+    filtered_force_ = lp_alpha * filtered_force_ + (1 - lp_alpha) * force_highpass_;
+    double filtered_force_magnitude = filtered_force_.norm();
+
+    double min_force_threshold = 1.5; // 阈值可根据实际调整
+    double feedback_gain = 1.2; // 反馈增强系数，可根据需要调整
+    if (filtered_force_magnitude > min_force_threshold) {
+
+      // RCLCPP_INFO_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 1000,
+      //   "TCP力(带通后): [%.3f, %.3f, %.3f] N (|F|=%.3f)",
+      //   filtered_force_(0), filtered_force_(1), filtered_force_(2), filtered_force_magnitude);
+    //   Eigen::Vector3d feedback_force = filtered_force_ * feedback_gain;
+
+    //   // std_msgs::msg::Float64MultiArray msg;
+    //   // msg.data.resize(7);
+    //   // msg.data[0] = feedback_force(0);
+    //   // msg.data[1] = feedback_force(1);
+    //   // msg.data[2] = feedback_force(2);
+    //   // msg.data[3] = wrench_tcp(3);
+    //   // msg.data[4] = wrench_tcp(4);
+    //   // msg.data[5] = wrench_tcp(5);
+    //   // msg.data[6] = 0.0; // 夹爪力，暂时为0
+    //   // force_pub_->publish(msg);
+    // }
+    // else {
+    //   // 力未达到阈值，发送全0
+    //   std_msgs::msg::Float64MultiArray msg;
+    //   msg.data.resize(7, 0.0);
+    //   force_pub_->publish(msg);
+    }
+
+      
+    
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(get_node()->get_logger(), "力反馈估算失败: %s", e.what());
+    }
+    static double last_sent_width = -1.0;
+    static rclcpp::Time last_gripper_cmd_time = get_node()->now();
+    if (index_pose_valid_) {
+      double distance = calculate_fingers_distance()*0.1;
+      if (distance > 0) {
+        double min_width = 0.01;
+        double max_width = 0.08;
+        double target_width = std::clamp(distance, min_width, max_width);
+        double width_delta = std::abs(target_width - last_sent_width);
+        double min_interval = 0.1; // 100ms，action机制建议不要太快
+        if (width_delta > 0.002 && (get_node()->now() - last_gripper_cmd_time).seconds() > min_interval) {
+          franka_msgs::action::Move::Goal goal;
+          goal.width = target_width;
+          goal.speed = 0.2;
+          gripper_move_action_client_->async_send_goal(goal);
+          last_sent_width = target_width;
+          last_gripper_cmd_time = get_node()->now();
+        }
+      }
+    }
+    return controller_interface::return_type::OK;
+
+  }
+
+private:
+  std::string ee_pose_topic_;
+  double ik_timeout_;
+  std::vector<std::string> joint_names_;
+  std::string arm_id_;
+
+  std::vector<double> k_gains_;
+  std::vector<double> d_gains_;
+
+  const std::vector<double> q_max{2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973};
+  const std::vector<double> q_min{-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973};
+  const std::vector<double> dq_max{2.1750, 2.1750, 2.1750, 2.1750, 2.6100, 2.6100, 2.6100};
+  const std::vector<double> ddq_max{15, 7.5, 10, 12.5, 15, 20, 20};
+  const std::vector<double> tau_max{87, 87, 87, 12, 87, 12, 12};
+  const std::vector<double> dtau_max{1000, 1000, 1000, 1000, 1000, 1000, 1000};
+
+  std::vector<double> joint_positions_desired_;
+  std::vector<double> joint_positions_current_;
+  std::vector<double> joint_velocities_current_;
+  std::vector<double> joint_efforts_current_;
+  Eigen::VectorXd dq_filtered_{Eigen::VectorXd::Zero(7)};
+  double dq_filter_alpha_{0.99};
+
+  std::vector<double> joint_positions_target_{7, 0.0}; // 目标关节角度
+  double max_joint_step_ = 0.002; // 每周期最大关节变化(rad)，可调
+  
+  Eigen::Vector3d filtered_force_{Eigen::Vector3d::Zero()};
+
+  Eigen::Vector3d force_highpass_{Eigen::Vector3d::Zero()};
+  Eigen::Vector3d force_last_{Eigen::Vector3d::Zero()};
+  double hp_alpha = 0.95; // 高通滤波系数，越接近1越慢
+
+  std::vector<double> q_init_{0, -M_PI_4, 0, -3*M_PI_4, 0, M_PI_2, M_PI_4}; // Franka默认初始位
+  bool move_to_init_{true}; // 控制是否需要回到初始位
+  double move_init_speed_{0.2}; // rad/s，插值速度
+
+  std::string index_finger_frame_{"fd_virtual_clutch_link"}; // 食指夹爪的TF坐标系
+  geometry_msgs::msg::PoseStamped thumb_pose_; // 拇指位姿
+  geometry_msgs::msg::PoseStamped index_pose_; // 食指位姿
+  bool index_pose_valid_{false}; // 是否成功获取到食指位姿
+  rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr index_pose_pub_; // 食指位姿发布器
+
+  rclcpp::Subscription<geometry_msgs::msg::PoseStamped>::SharedPtr pose_sub_;
+  std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
+  std::shared_ptr<tf2_ros::TransformListener> tf_listener_;
+  rclcpp::Client<moveit_msgs::srv::GetPositionIK>::SharedPtr ik_client_;  
+  rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr force_pub_;
+
+  std::unique_ptr<franka_semantic_components::FrankaRobotModel> franka_robot_model_;
+
+  rclcpp_action::Client<franka_msgs::action::Move>::SharedPtr gripper_move_action_client_;
+  rclcpp_action::Client<franka_msgs::action::Grasp>::SharedPtr gripper_grasp_action_client_;
+  
+
+  // 计算两指间距
+  double calculate_fingers_distance() {
+    if (!index_pose_valid_) {
+      return -1.0; // 无效值
+    }
+    
+    // 验证两个位姿在相同坐标系
+    if (thumb_pose_.header.frame_id != index_pose_.header.frame_id) {
+      RCLCPP_WARN(get_node()->get_logger(), 
+        "两指位姿参考系不同! 拇指=%s, 食指=%s",
+        thumb_pose_.header.frame_id.c_str(), 
+        index_pose_.header.frame_id.c_str());
+      return -1.0;
+    }
+    
+    double dx = index_pose_.pose.position.x - thumb_pose_.pose.position.x;
+    double dy = index_pose_.pose.position.y - thumb_pose_.pose.position.y;
+    double dz = index_pose_.pose.position.z - thumb_pose_.pose.position.z;
+    
+    return std::sqrt(dx*dx + dy*dy + dz*dz);
+  }
+  
+  // 获取两指的位置差异向量
+  Eigen::Vector3d get_fingers_displacement() {
+    if (!index_pose_valid_) {
+      return Eigen::Vector3d::Zero();
+    }
+    
+    Eigen::Vector3d displacement;
+    displacement(0) = index_pose_.pose.position.x - thumb_pose_.pose.position.x;
+    displacement(1) = index_pose_.pose.position.y - thumb_pose_.pose.position.y;
+    displacement(2) = index_pose_.pose.position.z - thumb_pose_.pose.position.z;
+    
+    return displacement;
+  }
+  void open_gripper() {
+    if (!gripper_move_action_client_->wait_for_action_server(std::chrono::seconds(2))) {
+      RCLCPP_ERROR(get_node()->get_logger(), "Gripper move action server not available.");
+      return;
+    }
+    franka_msgs::action::Move::Goal goal;
+    goal.width = 0.08; // 最大张开宽度
+    goal.speed = 0.2;
+    gripper_move_action_client_->async_send_goal(goal);
+    RCLCPP_INFO(get_node()->get_logger(), "已发送夹爪打开指令");
+  }
+
+  // 闭合夹爪
+  void close_gripper() {
+    if (!gripper_grasp_action_client_->wait_for_action_server(std::chrono::seconds(2))) {
+      RCLCPP_ERROR(get_node()->get_logger(), "Gripper grasp action server not available.");
+      return;
+    }
+    franka_msgs::action::Grasp::Goal goal;
+    goal.width = 0.015; // 闭合宽度
+    goal.speed = 0.05;
+    goal.force = 40.0;
+    goal.epsilon.inner = 0.005;
+    goal.epsilon.outer = 0.010;
+    gripper_grasp_action_client_->async_send_goal(goal);
+    RCLCPP_INFO(get_node()->get_logger(), "已发送夹爪闭合指令");
+  }
+  // 读取当前关节状态
+  void update_joint_states() {
+    for (size_t i = 0; i < 7; ++i) {
+      joint_positions_current_[i] = state_interfaces_.at(i).get_value();
+      joint_velocities_current_[i] = state_interfaces_.at(7 + i).get_value();
+      joint_efforts_current_[i] = state_interfaces_.at(14 + i).get_value();
+    }
+  }
+
+  // 目标位姿回调，调用IK服务
+  void pose_callback(const geometry_msgs::msg::PoseStamped::SharedPtr msg) {
+    try {
+
+      std::string model_frame = "base"; // 统一使用base作为参考坐标系
+    
+      // 1. 处理拇指位姿 - 确保转换到base坐标系
+      if (!msg->header.frame_id.empty() && msg->header.frame_id != model_frame) {
+        geometry_msgs::msg::PoseStamped pose_out;
+        try {
+          RCLCPP_DEBUG(get_node()->get_logger(), "转换拇指位姿从 %s 到 %s", 
+                    msg->header.frame_id.c_str(), model_frame.c_str());
+          tf_buffer_->transform(*msg, pose_out, model_frame, tf2::durationFromSec(0.2));
+          thumb_pose_ = pose_out; // 拇指位姿已转换为base坐标系
+        } catch (const tf2::TransformException& ex) {
+          RCLCPP_ERROR(get_node()->get_logger(), "拇指位姿转换失败: %s", ex.what());
+        }
+      } else {
+        // 已经在base坐标系，直接赋值
+        thumb_pose_ = *msg;
+      }
+      
+      // 添加明确的帧ID（防止意外清空）
+      thumb_pose_.header.frame_id = model_frame;
+      
+      // 2. 获取食指位姿 - 直接在base坐标系下获取
+      try {
+        geometry_msgs::msg::TransformStamped index_transform;
+        index_transform = tf_buffer_->lookupTransform(
+          model_frame,           // 目标坐标系：base
+          index_finger_frame_,   // 源坐标系：fd_virtual_clutch_link
+          tf2::TimePointZero     // 最新的可用变换
+        );
+        
+        // 构造食指位姿（确保在base坐标系下）
+        index_pose_.header.frame_id = model_frame;
+        index_pose_.header.stamp = get_node()->now();
+        index_pose_.pose.position.x = index_transform.transform.translation.x;
+        index_pose_.pose.position.y = index_transform.transform.translation.y;
+        index_pose_.pose.position.z = index_transform.transform.translation.z;
+        index_pose_.pose.orientation = index_transform.transform.rotation;
+        
+        index_pose_valid_ = true;
+        
+        // 3. 打印两指各自在base坐标系下的位置，确认一致性
+        RCLCPP_DEBUG(get_node()->get_logger(),
+          "两指位姿(base坐标系) - 拇指: [%.3f, %.3f, %.3f], 食指: [%.3f, %.3f, %.3f]",
+          thumb_pose_.pose.position.x, thumb_pose_.pose.position.y, thumb_pose_.pose.position.z,
+          index_pose_.pose.position.x, index_pose_.pose.position.y, index_pose_.pose.position.z);
+        
+        // 4. 计算相对位置
+        double dx = index_pose_.pose.position.x - thumb_pose_.pose.position.x;
+        double dy = index_pose_.pose.position.y - thumb_pose_.pose.position.y;
+        double dz = index_pose_.pose.position.z - thumb_pose_.pose.position.z;
+        double distance = std::sqrt(dx*dx + dy*dy + dz*dz);
+        
+        RCLCPP_DEBUG(get_node()->get_logger(), 
+          "两指间距: %.3f 米, 差异向量: [%.3f, %.3f, %.3f]",
+          distance, dx, dy, dz);
+          
+        // 发布食指位姿
+        index_pose_pub_->publish(index_pose_);
+        
+      } catch (const tf2::TransformException& ex) {
+        index_pose_valid_ = false;
+        RCLCPP_WARN_THROTTLE(get_node()->get_logger(), *get_node()->get_clock(), 2000,
+          "获取食指位姿失败: %s", ex.what());
+      }
+      
+      // 5. 为IK求解准备位姿（不变）
+      geometry_msgs::msg::PoseStamped target_pose_msg = thumb_pose_;
+      // geometry_msgs::msg::PoseStamped target_pose_msg = *msg;
+      // std::string model_frame = "base";
+      // if (!msg->header.frame_id.empty() && msg->header.frame_id != model_frame) {
+      //   geometry_msgs::msg::PoseStamped pose_out;
+      //   try {
+      //     tf_buffer_->transform(*msg, pose_out, model_frame, tf2::durationFromSec(0.2));
+      //     target_pose_msg = pose_out;
+      //   } catch (const tf2::TransformException& ex) {
+      //     RCLCPP_ERROR(get_node()->get_logger(), "位姿转换失败: %s", ex.what());
+      //     return;
+      //   }
+      // }
+      Eigen::Isometry3d eigen_pose;
+      tf2::fromMsg(target_pose_msg.pose, eigen_pose);
+      Eigen::AngleAxisd compensate_x(M_PI, Eigen::Vector3d::UnitX());
+      
+      eigen_pose.rotate(compensate_x);
+      
+      target_pose_msg.pose = tf2::toMsg(eigen_pose);      
+      
+
+      auto request = std::make_shared<moveit_msgs::srv::GetPositionIK::Request>();
+      request->ik_request.group_name = arm_id_ + "_arm";
+      request->ik_request.pose_stamped = target_pose_msg;
+      request->ik_request.pose_stamped.header.frame_id = model_frame;
+      request->ik_request.timeout = rclcpp::Duration::from_seconds(ik_timeout_);
+      request->ik_request.ik_link_name = arm_id_ + "_hand_tcp";
+      request->ik_request.robot_state.joint_state.name = joint_names_;
+      std::vector<double> current_joint_positions(joint_names_.size());
+      for (size_t i = 0; i < joint_names_.size(); ++i) {
+        current_joint_positions[i] = state_interfaces_[i].get_value();
+      }
+      request->ik_request.robot_state.joint_state.position = current_joint_positions;
+
+      
+      auto response_callback = [this](rclcpp::Client<moveit_msgs::srv::GetPositionIK>::SharedFuture future) {
+        auto response = future.get();
+        if (response->error_code.val == moveit_msgs::msg::MoveItErrorCodes::SUCCESS) {
+          // 限制肘部关节变化幅度
+          // const size_t elbow_idx = 3; // Franka第4关节
+          // double elbow_min = -2.5;    // 允许的最小值（单位：rad，根据实际机械臂调整）
+          // double elbow_max =  2.5;    // 允许的最大值（单位：rad，根据实际机械臂调整）
+          // double new_elbow = response->solution.joint_state.position[elbow_idx];
+          // if (new_elbow < elbow_min || new_elbow > elbow_max) {
+          //   RCLCPP_WARN(get_node()->get_logger(),
+          //     "IK解肘部关节超出限制(%.3f)，丢弃本次解。允许范围[%.3f, %.3f]", new_elbow, elbow_min, elbow_max);
+          //   return;
+          // }
+          joint_positions_target_ = response->solution.joint_state.position;
+        } else {
+          RCLCPP_WARN(get_node()->get_logger(), "IK服务求解失败，错误码: %d", response->error_code.val);
+        }
+      };
+      ik_client_->async_send_request(request, response_callback);
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(get_node()->get_logger(), "处理位姿消息时出错: %s", e.what());
+    }
+  }
+};
+
+} // namespace franka_example_controllers
+
+#include "pluginlib/class_list_macros.hpp"
+PLUGINLIB_EXPORT_CLASS(franka_example_controllers::JointImpedanceMoveItController, controller_interface::ControllerInterface)

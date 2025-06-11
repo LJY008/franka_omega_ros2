@@ -137,7 +137,13 @@ controller_interface::return_type JointImpedanceWithIKExampleController::update(
   if (initialization_flag_) {
     std::tie(orientation_, position_) =
         franka_cartesian_pose_->getCurrentOrientationAndTranslation();
-
+        // 查看 orientation_ 和 position_ 的内容和类型
+    RCLCPP_INFO(get_node()->get_logger(), "orientation_ type: %s", typeid(orientation_).name());
+    RCLCPP_INFO(get_node()->get_logger(), "position_ type: %s", typeid(position_).name());
+    RCLCPP_INFO(get_node()->get_logger(), "orientation_: x=%f, y=%f, z=%f, w=%f",
+          orientation_.x(), orientation_.y(), orientation_.z(), orientation_.w());
+    RCLCPP_INFO(get_node()->get_logger(), "position_: x=%f, y=%f, z=%f",
+          position_.x(), position_.y(), position_.z());
     initial_robot_time_ = state_interfaces_.back().get_value();
     elapsed_time_ = 0.0;
     initialization_flag_ = false;
@@ -238,7 +244,9 @@ CallbackReturn JointImpedanceWithIKExampleController::on_configure(
       "/service_server/set_full_collision_behavior");
   compute_ik_client_ = get_node()->create_client<moveit_msgs::srv::GetPositionIK>("/compute_ik");
 
-  while (!compute_ik_client_->wait_for_service(1s) || !collision_client->wait_for_service(1s)) {
+  while (!compute_ik_client_->wait_for_service(1s) || !collision_client->wait_for_service(1s))
+  
+   {
     if (!rclcpp::ok()) {
       RCLCPP_ERROR(get_node()->get_logger(), "Interrupted while waiting for the service. Exiting.");
       return CallbackReturn::ERROR;

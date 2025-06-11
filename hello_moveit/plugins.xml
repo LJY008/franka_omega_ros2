@@ -1,0 +1,18 @@
+<library path="moveit_franka_controller">
+  <class
+      name="franka_example_controllers/JointImpedanceMoveItController"
+      type="franka_example_controllers::JointImpedanceMoveItController"
+      base_class_type="controller_interface::ControllerInterface">
+    <description>
+      MoveIt关节速度控制器
+    </description>
+  </class>
+  <class
+      name="franka_example_controllers/JointImpedanceMoveItControllerG"
+      type="franka_example_controllers::JointImpedanceMoveItControllerG"
+      base_class_type="controller_interface::ControllerInterface">
+    <description>
+      MoveIt关节阻抗控制器（Gazebo仿真专用）
+    </description>
+  </class>
+</library>

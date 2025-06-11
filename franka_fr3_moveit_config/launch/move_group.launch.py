@@ -102,10 +102,10 @@ def generate_launch_description():
         parameters=[
             robot_description,
             robot_description_semantic,
-            kinematics_yaml,
+             kinematics_yaml,
         ],
     )
-
+    print("Loaded kinematics_yaml:", kinematics_yaml)
     return LaunchDescription(
         [
             db_arg,

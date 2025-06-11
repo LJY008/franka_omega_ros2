@@ -48,7 +48,11 @@ controller_manager:
       type: joint_state_broadcaster/JointStateBroadcaster
     
     franka_robot_state_broadcaster:
-      type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster
+      type: franka_robot_state_broadcaster/FrankaRobotStateBroadcaster    
+    
+    moveit_franka_controller:
+      type: franka_example_controllers/JointImpedanceMoveItController
+    
 
 joint_impedance_with_ik_example_controller:
   ros__parameters:
@@ -72,21 +76,21 @@ joint_impedance_with_ik_example_controller:
 joint_impedance_example_controller:
   ros__parameters:
     k_gains:
-      - 24.0
-      - 24.0
-      - 24.0
-      - 24.0
-      - 10.0
-      - 6.0
-      - 2.0
+      - 600.0
+      - 600.0
+      - 600.0
+      - 600.0
+      - 250.0
+      - 150.0
+      - 50.0
     d_gains:
-      - 2.0
-      - 2.0
-      - 2.0
-      - 1.0
-      - 1.0
-      - 1.0
-      - 0.5
+      - 30.0
+      - 30.0
+      - 30.0
+      - 30.0
+      - 10.0
+      - 10.0
+      - 5.
 move_to_start_example_controller:
   ros__parameters:
     k_gains:
@@ -105,3 +109,40 @@ move_to_start_example_controller:
       - 10.0
       - 10.0
       - 5.
+moveit_franka_controller:
+  ros__parameters:
+    arm_id: "fr3"    
+    ee_pose_topic: "/fd/ee_pose"
+    ik_timeout: 0.2
+    max_joint_velocity: 0.2
+    use_real_robot: false
+    joints:
+      - fr3_joint1
+      - fr3_joint2
+      - fr3_joint3
+      - fr3_joint4
+      - fr3_joint5
+      - fr3_joint6
+      - fr3_joint7
+    command_interfaces:
+      - effort
+    state_interfaces:
+      - position
+      - velocity
+      - effort
+    k_gains:
+      - 80.0
+      - 80.0
+      - 80.0
+      - 80.0
+      - 70.0
+      - 70.0
+      - 50.0
+    d_gains:
+      - 30.0
+      - 30.0
+      - 30.0
+      - 30.0
+      - 10.0
+      - 10.0
+      - 5.0

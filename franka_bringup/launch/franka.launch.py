@@ -49,6 +49,15 @@ def robot_description_dependent_nodes_spawner(
         fake_sensor_commands)
     load_gripper_str = context.perform_substitution(load_gripper)
 
+    # franka_semantic_xacro_filepath = os.path.join(
+    #     get_package_share_directory('franka_fr3_moveit_config'),
+    #     'srdf', 'fr3_arm.srdf.xacro'
+    # )
+    # robot_description_semantic = xacro.process_file(
+    #     franka_semantic_xacro_filepath,
+    #     mappings={'hand': load_gripper_str}
+    # ).toprettyxml(indent='  ')
+
     franka_xacro_filepath = os.path.join(get_package_share_directory(
         'franka_description'), 'robots', arm_id_str, arm_id_str+'.urdf.xacro')
     robot_description = xacro.process_file(franka_xacro_filepath,
@@ -78,6 +87,7 @@ def robot_description_dependent_nodes_spawner(
             executable='ros2_control_node',
             parameters=[franka_controllers,
                         {'robot_description': robot_description},
+                        
                         {'arm_id': arm_id},
                         {'load_gripper': load_gripper},
                         ],
