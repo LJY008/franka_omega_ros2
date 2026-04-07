@@ -1,209 +1,254 @@
-<h1 style="font-size: 3em;">ROS 2 Integration for Franka Robotics Research Robots</h1>
+# franka_omega_ros2 — Franka FR3 × Omega7 遥操作系统
 
-[![CI](https://github.com/frankaemika/franka_ros2/actions/workflows/ci.yml/badge.svg)](https://github.com/frankaemika/franka_ros2/actions/workflows/ci.yml)
+本仓库在 [frankaemika/franka_ros2](https://github.com/frankaemika/franka_ros2) 的基础上，增加了基于 **Force Dimension Omega7** 触觉主手的遥操作功能，实现对 **Franka Research 3 (FR3)** 机械臂的实时阻抗遥操作，并支持力反馈回传。
 
-> **Note:** _franka_ros2_ is not officially supported on Windows.
+---
 
-#### Table of Contents
-- [About](#about)
-- [Caution](#caution)
-- [Setup](#setup)
-  - [Local Machine Installation](#local-machine-installation)
-  - [Docker Container Installation](#docker-container-installation)
-- [Test the Setup](#test-the-setup)
-- [Troubleshooting](#troubleshooting)
-  - [libfranka: UDP receive: Timeout error](#libfranka-udp-receive-timeout-error)
-- [Contributing](#contributing)
-- [License](#license)
-- [Contact](#contact)
+## 目录
 
-# About
-The **franka_ros2** repository provides a **ROS 2** integration of **libfranka**, allowing efficient control of the Franka Robotics arm within the ROS 2 framework. This project is designed to facilitate robotic research and development by providing a robust interface for controlling the research versions of Franka Robotics robots.
+- [系统概述](#系统概述)
+- [硬件与软件依赖](#硬件与软件依赖)
+- [系统架构](#系统架构)
+- [受控端（Franka FR3）](#受控端franka-fr3)
+  - [核心控制器：JointImpedanceMoveItController](#核心控制器jointimpedancemoveitcontroller)
+  - [关键话题与参数](#关键话题与参数)
+  - [启动方法](#启动方法)
+- [主操作端（Omega7）](#主操作端omega7)
+- [环境安装](#环境安装)
+  - [本地安装](#本地安装)
+  - [Docker 安装](#docker-安装)
+- [构建与测试](#构建与测试)
+- [常见问题](#常见问题)
+- [许可证](#许可证)
 
-For convenience, we provide Dockerfile and docker-compose.yml files. While it is possible to build **franka_ros2** directly on your local machine, this approach requires manual installation of certain dependencies, while many others will be automatically installed by the **ROS 2** build system (e.g., via **rosdep**). This can result in a large number of libraries being installed on your system, potentially causing conflicts. Using Docker encapsulates these dependencies within the container, minimizing such risks. Docker also ensures a consistent and reproducible build environment across systems. For these reasons, we recommend using Docker.
+---
 
-# Caution
-This package is in rapid development. Users should expect breaking changes and are encouraged to report any bugs via [GitHub Issues page](https://github.com/frankaemika/franka_ros2/issues).
+## 系统概述
 
-# Franka ROS 2 Dependencies Setup
+本系统由两端组成：
 
-This repository contains a `.repos` file that helps you clone the required dependencies for Franka ROS 2.
+| 端 | 硬件 | 软件包 | 作用 |
+|---|---|---|---|
+| **主操作端** | Force Dimension **Omega7** | [ICUBE-ROBOTICS/forcedimensionROS](https://github.com/ICube-Robotics/forcedimension_ros2) | 采集操作者手部末端位姿并发送到受控端；接收力反馈并驱动 Omega7 产生力觉 |
+| **受控端** | Franka Research 3 (**FR3**) | 本仓库 `hello_moveit` 包 | 订阅末端目标位姿，通过 MoveIt IK 求逆解，用关节阻抗控制驱动机械臂；同时估算接触力并回传 |
 
-## Prerequisites
+---
 
-## Local Machine Installation
-1. **Install ROS2 Development environment**
+## 硬件与软件依赖
 
-    _**franka_ros2**_ is built upon _**ROS 2 Humble**_.  
+- **操作系统**：Ubuntu 22.04
+- **ROS 版本**：ROS 2 Humble
+- **机械臂**：Franka Research 3（FR3），搭载 Franka 夹爪
+- **主手**：[Force Dimension Omega7](https://www.forcedimension.com/products/omega)
+- **主手 ROS 驱动**：[ICUBE-ROBOTICS/forcedimension_ros2](https://github.com/ICube-Robotics/forcedimension_ros2)
+- **MoveIt 2**：用于在线逆运动学（`/compute_ik` 服务）
+- **franka_ros2**：libfranka 的 ROS 2 封装（本仓库上游）
 
-    To set up your ROS 2 environment, follow the official _**humble**_ installation instructions provided [**here**](https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html). 
-    The guide discusses two main installation options: **Desktop** and **Bare Bones**.
+---
 
-    #### Choose **one** of the following:
-    - **ROS 2 "Desktop Install"** (`ros-humble-desktop`)  
-      Includes a full ROS 2 installation with GUI tools and visualization packages (e.g., Rviz and Gazebo).  
-      **Recommended** for users who need simulation or visualization capabilities.
+## 系统架构
 
-    - **"ROS-Base Install (Bare Bones)"** (`ros-humble-ros-base`)  
-      A minimal installation that includes only the core ROS 2 libraries.  
-      Suitable for resource-constrained environments or headless systems.
+```
+┌─────────────────────────────────────┐        ┌──────────────────────────────────────────┐
+│          主操作端（Omega7）           │        │          受控端（Franka FR3）              │
+│                                     │        │                                          │
+│  forcedimension_ros2 驱动           │        │  JointImpedanceMoveItController          │
+│  ┌──────────────────────────────┐   │        │  ┌────────────────────────────────────┐  │
+│  │ 读取 Omega7 末端位姿          │   │  位姿  │  │ 订阅 /fd/ee_pose                   │  │
+│  │ 发布 /fd/ee_pose             │──────────>│  │ 调用 /compute_ik (MoveIt)          │  │
+│  │ 发布 TF: fd_base/fd_ee 等    │   │        │  │ 关节阻抗控制律: τ = K(qd-q)-D(dq̇) │  │
+│  └──────────────────────────────┘   │        │  │ 估算末端接触力 (Jacobian + 动力学)  │  │
+│  ┌──────────────────────────────┐   │  力反馈 │  │ 发布 /fd/fd_controller/commands   │  │
+│  │ 订阅 /fd/fd_controller/      │<──────────│  └────────────────────────────────────┘  │
+│  │        commands              │   │        │                                          │
+│  │ 驱动 Omega7 输出力觉          │   │        │  Franka Gripper (Move / Grasp Action)    │
+│  └──────────────────────────────┘   │        │  订阅 /fd/index_pose (食指位姿 → 夹爪宽度) │
+└─────────────────────────────────────┘        └──────────────────────────────────────────┘
+```
 
-    ```bash
-    # replace <YOUR CHOICE> with either ros-humble-desktop or ros-humble-ros-base
-    sudo apt install <YOUR CHOICE>  
-    ```
-    ---
-    Also install the **Development Tools** package:
-    ```bash
-    sudo apt install ros-dev-tools
-    ```
-    Installing the **Desktop** or **Bare Bones** should automatically source the **ROS2** environment but, under some circumstances you may need to do this again:
-    ```bash
-    source /opt/ros/humble/setup.sh
-    ```
+---
 
-2. **Create a ROS 2 Workspace:**
-   ```bash
-   mkdir -p ~/franka_ros2_ws/src
-   cd ~/franka_ros2_ws  # not into src
+## 受控端（Franka FR3）
+
+### 核心控制器：JointImpedanceMoveItController
+
+位于 `hello_moveit/` 包，以 `ros2_control` pluginlib 插件形式注册，类型名为  
+`franka_example_controllers/JointImpedanceMoveItController`。
+
+**工作流程：**
+
+1. 订阅主操作端发布的末端目标位姿（`/fd/ee_pose`，类型 `geometry_msgs/PoseStamped`）。
+2. 将位姿转换至机器人 `base` 坐标系，并进行姿态补偿（绕 X 轴旋转 π）。
+3. 异步调用 MoveIt `/compute_ik` 服务求解 7 自由度逆运动学。
+4. 对目标关节角施加步长限制（`max_joint_step_ = 0.002 rad/周期`），平滑插值至期望位置。
+5. 执行关节阻抗控制律：
    ```
-3. **Clone the Repositories:**
-   ```bash
-    git clone https://github.com/frankaemika/franka_ros2.git src
-    ```
-4. **Install the dependencies**
-    ```bash
-    vcs import src < src/franka.repos --recursive --skip-existing
-    ```
-5. **Detect and install project dependencies**
-   ```bash
-   rosdep install --from-paths src --ignore-src --rosdistro humble -y
+   τ = K · (qd - q) - D · dq_filtered
    ```
-6. **Build**
-   ```bash
-   # use the --symlinks option to reduce disk usage, and facilitate development.
-   colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
-   ```
-7. **Adjust Enviroment**
-   ```bash
-   # Adjust environment to recognize packages and dependencies in your newly built ROS 2 workspace.
-   source install/setup.sh
-   ```
+   力矩及力矩变化率均有安全限制。
+6. 通过 Jacobian 和机器人动力学模型估算末端接触力，经带通滤波后发布至 `/fd/fd_controller/commands`，驱动 Omega7 产生力反馈。
+7. 通过 TF 追踪 `fd_virtual_clutch_link`（食指位姿），估算手指张开宽度并周期性发送夹爪控制指令（Franka Gripper Move Action）。
 
-## Docker Container Installation
-The **franka_ros2** package includes a `Dockerfile` and a `docker-compose.yml`, which allows you to use `franka_ros2` packages without manually installing **ROS 2**. Also, the support for Dev Containers in Visual Studio Code is provided.
+### 关键话题与参数
 
-For detailed instructions, on preparing VSCode to use the `.devcontainer` follow the setup guide from [VSCode devcontainer_setup](https://code.visualstudio.com/docs/devcontainers/tutorial).
+| 话题 | 方向 | 类型 | 说明 |
+|------|------|------|------|
+| `/fd/ee_pose` | 订阅 | `geometry_msgs/PoseStamped` | Omega7 末端目标位姿（主手发布） |
+| `/fd/fd_controller/commands` | 发布 | `std_msgs/Float64MultiArray` | 力反馈指令，回传给主手（7维：fx, fy, fz, tx, ty, tz, 0） |
+| `/fd/index_pose` | 发布 | `geometry_msgs/PoseStamped` | 食指位姿（调试用） |
 
-1. **Clone the Repositories:**
-    ```bash
-    git clone https://github.com/frankaemika/franka_ros2.git
-    cd franka_ros2
-    ```
-    We provide separate instructions for using Docker with Visual Studio Code or the command line. Choose one of the following options:
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `ee_pose_topic` | `/fd/ee_pose` | 末端位姿话题名 |
+| `arm_id` | `fr3` | 机械臂 ID |
+| `joints` | `[fr3_joint1 … fr3_joint7]` | 关节名列表 |
+| `k_gains` | `[100.0 × 7]` | 阻抗刚度增益 |
+| `d_gains` | `[10.0 × 7]` | 阻抗阻尼增益 |
+| `ik_timeout` | `0.2 s` | IK 求解超时时间 |
 
-    Option A: Set up and use Docker from the command line (without Visual Studio Code).
+### 启动方法
 
-    Option B: Set up and use Docker with Visual Studio Code's Docker support.
+**实体机器人（FR3）：**
 
-#### Option A: using Docker Compose
+```bash
+# 终端 1：启动 franka_ros2 + MoveIt
+ros2 launch hello_moveit moveitfranka.launch.py robot_ip:=<机器人IP>
 
-  2. **Save the current user id into a file:**
-      ```bash
-      echo -e "USER_UID=$(id -u $USER)\nUSER_GID=$(id -g $USER)" > .env
-      ```
-      It is needed to mount the folder from inside the Docker container.
+# 终端 2：启动 Omega7 驱动（参见主操作端说明）
+```
 
-  3. **Build the container:**
-      ```bash
-      docker compose build
-      ```
-  4. **Run the container:**
-      ```bash
-      docker compose up -d
-      ```
-  5. **Open a shell inside the container:**
-      ```bash
-      docker exec -it franka_ros2 /bin/bash
-      ```
-  6. **Clone the latests dependencies:**
-      ```bash
-      vcs import src < src/franka.repos --recursive --skip-existing
-      ```
-  7. **Build the workspace:**
-      ```bash
-      colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
-      ```
-  7. **Source the built workspace:**
-      ```bash
-      source install/setup.bash
-      ```
-  8. **When you are done, you can exit the shell and delete the container**:
-      ```bash
-      docker compose down -t 0
-      ```
-
-#### Option B: using Dev Containers in Visual Studio Code
-
-  2. **Open Visual Studio Code ...**
-  
-        Then, open folder  `franka_ros2`
-
-  3. **Choose `Reopen in container` when prompted.**
-
-      The container will be built automatically, as required.
-
-  4. **Clone the latests dependencies:**
-      ```bash
-      vcs import src < src/franka.repos --recursive --skip-existing
-      ```
-
-  5. **Open a terminal and build the workspace:**
-      ```bash
-      colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
-      ```
-  6. **Source the built workspace environment:**
-      ```bash
-      source install/setup.bash
-      ```
-
-
-# Test the build
-   ```bash
-   colcon test
-   ```
-> Remember, franka_ros2 is under development.  
-> Warnings can be expected.  
-
-# Run a sample ROS2 application
-
-To verify that your setup works correctly without a robot, you can run the following command to use dummy hardware:
+**仿真（fake hardware）：**
 
 ```bash
 ros2 launch franka_fr3_moveit_config moveit.launch.py robot_ip:=dont-care use_fake_hardware:=true
 ```
 
+---
 
-# Troubleshooting
+## 主操作端（Omega7）
+
+主操作硬件为 **Force Dimension Omega7**，使用 **[ICUBE-ROBOTICS/forcedimension_ros2](https://github.com/ICube-Robotics/forcedimension_ros2)** 驱动包（原名 `forcedimensionROS`）。
+
+该包负责：
+- 读取 Omega7 的末端位置与姿态，发布为 `geometry_msgs/PoseStamped`（话题 `/fd/ee_pose`）；
+- 维护 Omega7 的 TF 树（`fd_base` → `fd_yaw_link` → `fd_virtual_clutch_link` 等）；
+- 订阅 `/fd/fd_controller/commands`（`std_msgs/Float64MultiArray`，7维力/力矩），驱动 Omega7 输出力反馈。
+
+**安装与启动请参考上游文档：**  
+[https://github.com/ICube-Robotics/forcedimension_ros2](https://github.com/ICube-Robotics/forcedimension_ros2)
+
+安装 Force Dimension SDK 后，启动主手驱动节点：
+
+```bash
+ros2 launch forcedimension_ros2 fd.launch.py
+```
+
+---
+
+## 环境安装
+
+### 本地安装
+
+1. **安装 ROS 2 Humble**
+
+    参考官方文档：<https://docs.ros.org/en/humble/Installation/Ubuntu-Install-Debs.html>
+
+    ```bash
+    # 选择 Desktop 或 Bare Bones（推荐 Desktop）
+    sudo apt install ros-humble-desktop
+    sudo apt install ros-dev-tools
+    source /opt/ros/humble/setup.sh
+    ```
+
+2. **创建工作空间并克隆本仓库**
+
+    ```bash
+    mkdir -p ~/franka_ros2_ws/src
+    cd ~/franka_ros2_ws
+    git clone https://github.com/LJY008/franka_omega_ros2.git src
+    ```
+
+3. **拉取 franka_ros2 上游依赖**
+
+    ```bash
+    vcs import src < src/franka.repos --recursive --skip-existing
+    ```
+
+4. **安装 ROS 依赖**
+
+    ```bash
+    rosdep install --from-paths src --ignore-src --rosdistro humble -y
+    ```
+
+5. **克隆并安装 forcedimension_ros2（主手驱动）**
+
+    ```bash
+    git clone https://github.com/ICube-Robotics/forcedimension_ros2.git src/forcedimension_ros2
+    # 按照该仓库说明安装 Force Dimension SDK
+    rosdep install --from-paths src/forcedimension_ros2 --ignore-src --rosdistro humble -y
+    ```
+
+6. **编译**
+
+    ```bash
+    colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+    source install/setup.bash
+    ```
+
+### Docker 安装
+
+本仓库继承了上游的 `Dockerfile` 与 `docker-compose.yml`。
+
+```bash
+echo -e "USER_UID=$(id -u $USER)\nUSER_GID=$(id -g $USER)" > .env
+docker compose build
+docker compose up -d
+docker exec -it franka_ros2 /bin/bash
+# 在容器内执行上述步骤 3–6
+```
+
+---
+
+## 构建与测试
+
+```bash
+colcon build --symlink-install --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon test
+```
+
+> ⚠️ 本项目处于开发阶段，构建时可能出现警告，属正常现象。
+
+---
+
+## 常见问题
+
 #### `libfranka: UDP receive: Timeout error`
 
-If you encounter a UDP receive timeout error while communicating with the robot, avoid using Docker Desktop. It may not provide the necessary real-time capabilities required for reliable communication with the robot. Instead, using Docker Engine is sufficient for this purpose.
+- 避免使用 Docker Desktop，改用 Docker Engine。
+- 建议为机器人控制机安装实时内核，参考 [Franka 安装文档](https://frankaemika.github.io/docs/installation_linux.html#setting-up-the-real-time-kernel)。
 
-A real-time kernel is essential to ensure proper communication and to prevent timeout issues. For guidance on setting up a real-time kernel, please refer to the [Franka installation documentation](https://frankaemika.github.io/docs/installation_linux.html#setting-up-the-real-time-kernel).
+#### IK 求解失败 / 无法找到 `/compute_ik` 服务
 
-# Contributing
+- 确认 MoveIt `move_group` 节点已启动，且使用的 `arm_id` 与 URDF/MoveIt 配置一致（默认 `fr3`）。
 
-Contributions are welcome! Please see [CONTRIBUTING.md](https://github.com/frankaemika/franka_ros2/blob/humble/CONTRIBUTING.md) for more details on how to contribute to this project.
+#### Omega7 无力反馈
 
-## License
+- 检查 `/fd/fd_controller/commands` 话题是否有数据发布；
+- 确认 forcedimension_ros2 驱动节点正常运行，Force Dimension SDK 版本兼容。
 
-All packages of franka_ros2 are licensed under the Apache 2.0 license.
+---
 
-## Contact 
+## 许可证
 
-For questions or support, please open an issue on the [GitHub Issues](https://github.com/frankaemika/franka_ros2/issues) page.
+- 本仓库中来自 `frankaemika/franka_ros2` 的代码遵循 **Apache 2.0** 许可证。
+- `hello_moveit` 包（遥操作控制器）遵循 **MIT** 许可证。
 
-See the [Franka Control Interface (FCI) documentation](https://frankaemika.github.io/docs) for more information.
+---
 
+## 参考链接
 
-[def]: #docker-container-installation
+- [Franka Robotics FCI 文档](https://frankaemika.github.io/docs)
+- [franka_ros2 上游仓库](https://github.com/frankaemika/franka_ros2)
+- [ICUBE-ROBOTICS/forcedimension_ros2](https://github.com/ICube-Robotics/forcedimension_ros2)
+- [Force Dimension Omega7](https://www.forcedimension.com/products/omega)
+- [MoveIt 2 文档](https://moveit.picknik.ai/humble/index.html)
