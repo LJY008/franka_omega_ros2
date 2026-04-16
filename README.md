@@ -4,9 +4,16 @@
 
 ---
 ## Demo Video（演示视频）
-从端视角[![demo](64ed838f428fe66323566e0b2c54896b.jpg)](<https://github.com/user-attachments/assets/b4db1ad7-4333-440a-ae90-3959940e6b03>)
 
-操作端视角[![demo](deb2e50a8f2499978a0060f87ee4807a.jpg)](<https://github.com/user-attachments/assets/fd63114d-1f20-4d3b-943d-ab05e954fb37>)
+从端视角  
+<a href="https://github.com/user-attachments/assets/b4db1ad7-4333-440a-ae90-3959940e6b03">
+  <img src="64ed838f428fe66323566e0b2c54896b.jpg" width="80%">
+</a>
+
+操作端视角  
+<a href="https://github.com/user-attachments/assets/fd63114d-1f20-4d3b-943d-ab05e954fb37">
+  <img src="deb2e50a8f2499978a0060f87ee4807a.jpg" width="80%">
+</a>
 ## 目录
 
 - [系统概述](#系统概述)
