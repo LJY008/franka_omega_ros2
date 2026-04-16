@@ -4,7 +4,7 @@
 
 ---
 ## Demo Video（演示视频）
-[![demo](64ed838f428fe66323566e0b2c54896b.jpg)](<https://github.com/user-attachments/assets/b4db1ad7-4333-440a-ae90-3959940e6b03>)
+[![demo](64ed838f428fe66323566e0b2c54896b.mp4)]
 <https://github.com/user-attachments/assets/fd63114d-1f20-4d3b-943d-ab05e954fb37>
 ## 目录
 
